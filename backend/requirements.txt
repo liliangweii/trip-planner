@@ -28,6 +28,9 @@ loguru>=0.7
 SQLAlchemy>=2.0               # 会话记忆存储
 python-multipart>=0.0.9       # FastAPI 文件上传（/api/kb/ingest）
 
-# ===== 评测（P6 阶段再装，避免影响 P1 环境搭建）=====
-# ragas>=0.2
-# datasets>=2.0
+# ===== 评测（P6）=====
+# 注意：ragas 0.4.x 的 collections 指标与 evaluate() 基类体系错位（实测报
+# "All metrics must be initialised metric objects"），锁 0.3.9；其安装会把 openai
+# 降回 1.x（与 langchain-openai 兼容，pip check 通过）
+ragas==0.3.9
+datasets>=2.0

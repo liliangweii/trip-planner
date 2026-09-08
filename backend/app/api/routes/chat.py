@@ -45,6 +45,10 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             yield "data: [DONE]\n\n"
         except Exception as exc:  # noqa: BLE001
             logger.exception("问答流式异常: {}", exc)
-            yield f"data: [ERROR] {exc}\n\n"
+            msg = str(exc)
+            # 402 = 余额不足：给用户可操作提示，而非裸抛供应商错误
+            if "402" in msg or "Insufficient Balance" in msg:
+                msg = "LLM 账户余额不足（402），请到供应商平台充值后重试。"
+            yield f"data: [ERROR] {msg}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
