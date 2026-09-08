@@ -31,7 +31,8 @@ class WeatherInput(BaseModel):
 
 @tool("amap_weather", args_schema=WeatherInput)
 def amap_weather_tool(city: str) -> str:
-    """高德天气查询：返回行程日期内的逐日天气预报。"""
+    """高德天气查询：返回逐日预报。注意：高德仅提供自今天起约未来 4 天预报；
+    若行程日期不在返回的日期内，请在 TripPlan 中把 weather_info 置为 []，不要错贴或编造。"""
     try:
         return weather(city=city)
     except Exception as exc:  # noqa: BLE001

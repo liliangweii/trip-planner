@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     rerank_top_k: int = Field(default=5, description="重排序后取 top_k 进 Prompt")
     rrf_k: int = Field(default=60, description="RRF 融合常数 k")
 
+    # ---- 规划模式 ----
+    planner_mode: Literal["agent", "fast"] = Field(
+        default="fast",
+        description=(
+            "agent=Tool-Calling Agent 完整编排（自适应但慢，~200s）；"
+            "fast=确定性管道(检索+天气+POI 补点) + 单次 LLM 结构化生成（快，~30s）"
+        ),
+    )
+
     # ---- 服务运行 ----
     app_host: str = Field(default="0.0.0.0")
     app_port: int = Field(default=8000)

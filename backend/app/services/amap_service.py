@@ -70,6 +70,41 @@ def poi_search(query: str, city: str, citylimit: bool = True, page: int = 1) -> 
     return "\n".join(lines)
 
 
+# ---------- POI 坐标抽取（供降级计划补点用） ----------
+
+def poi_location(query: str, city: str) -> dict | None:
+    """返回第一个 POI 的结构化坐标 {name,address,lng,lat}；无结果返回 None。
+
+    与 poi_search（给 LLM 的文本）互补：这是给确定性代码用的结构化入口。
+    """
+    try:
+        data = _get(
+            "/v3/place/text",
+            {
+                "keywords": query,
+                "city": city,
+                "citylimit": "true",
+                "offset": 3,
+                "page": 1,
+                "extensions": "base",
+            },
+        )
+    except RuntimeError:
+        return None
+    pois = data.get("pois") or []
+    if not pois:
+        return None
+    p = pois[0]
+    loc = (p.get("location") or "0,0").split(",")
+    try:
+        lng, lat = float(loc[0]), float(loc[1])
+    except (ValueError, IndexError):
+        return None
+    if abs(lng) < 0.001 and abs(lat) < 0.001:
+        return None
+    return {"name": p.get("name", ""), "address": p.get("address", ""), "lng": lng, "lat": lat}
+
+
 # ---------- 天气 ----------
 
 def weather(city: str) -> str:
@@ -94,6 +129,35 @@ def weather(city: str) -> str:
             )
         )
     return "\n".join(lines)
+
+
+def weather_casts(city: str) -> list[dict]:
+    """返回结构化逐日预报列表（最多约 5 天，自今天起）。
+
+    注意能力边界：高德仅提供未来约 4 天预报，行程日期超出该窗口时
+    调用方必须把 weather_info 置空，绝不能把窗口内预报错贴到未来日期。
+    """
+    try:
+        data = _get(
+            "/v3/weather/weatherInfo",
+            {"city": city, "extensions": "all"},
+        )
+    except RuntimeError:
+        return []
+    forecasts = data.get("forecasts") or []
+    if not forecasts:
+        return []
+    casts = []
+    for c in (forecasts[0].get("casts") or [])[:8]:
+        casts.append(
+            {
+                "date": c.get("date", ""),
+                "day_weather": c.get("dayweather", ""),
+                "night_weather": c.get("nightweather", ""),
+                "temperature": f"{c.get('daytemp', '?')}℃~{c.get('nighttemp', '?')}℃",
+            }
+        )
+    return casts
 
 
 # ---------- 路线规划 ----------

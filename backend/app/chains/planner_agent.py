@@ -51,7 +51,8 @@ SCHEMA_HINT = """最终只输出一个 TripPlan JSON 对象（不要 markdown �
  "references": [{"chunk_id": str, "source": str, "snippet": str}]}
 
 硬约束：attractions/overall_suggestions 的事实只能来自 search_travel_knowledge 返回的 [n] 片段并标注；
-citations.chunk_id 必须使用工具返回的 pk；无坐标数据时 location 用 0.0。"""
+citations.chunk_id 必须使用工具返回的 pk；无坐标数据时 location 用 0.0；
+weather_info 只能填天气材料（高德仅未来约 4 天）中真实出现的日期，行程超出窗口则必须为 []，严禁编造。"""
 
 _PK_RE = re.compile(r"pk=(\d+)")
 _CTX_MAX = 280  # 每条上下文截断长度（控制 token）
@@ -130,6 +131,35 @@ def _validate(data: dict) -> TripPlan | None:
         return None
 
 
+def _fill_missing_coords(plan: TripPlan, req: TripRequest) -> TripPlan:
+    """降级计划坐标补全：对所有坐标为 0 的景点，按名称确定性直调高德 POI 补真实坐标。
+
+    L2/L3 的坐标是 0.0（降级设计）；这一步把"取坐标"从 Agent 的随机决策
+    变成确定性代码（P4 复盘优化项），保证降级计划也能在地图上打点。
+    任何失败都静默跳过（保持降级可用性优先）。
+    """
+    if not settings.amap_api_key:
+        return plan
+    try:
+        from app.services.amap_service import poi_location
+
+        for day in plan.days:
+            for attr in day.attractions:
+                loc = attr.location
+                if loc is not None and (abs(loc.longitude) > 0.001 or abs(loc.latitude) > 0.001):
+                    continue  # 已有真实坐标（L1 产物）不重复请求
+                hit = poi_location(attr.name, req.city)
+                if hit is None:
+                    continue
+                attr.location.longitude = hit["lng"]
+                attr.location.latitude = hit["lat"]
+                if not attr.address:
+                    attr.address = hit["address"]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("坐标补全失败（忽略，维持降级计划）: {}", exc)
+    return plan
+
+
 # ---------- 三级降级 ----------
 
 def _build_agent_executor():
@@ -154,7 +184,7 @@ def _build_agent_executor():
     return AgentExecutor(
         agent=agent,
         tools=tools,
-        max_iterations=10,
+        max_iterations=8,  # 瘦身：减少潜在的长尾工具往返
         handle_parsing_errors=True,
         return_intermediate_steps=True,  # 构造参数：把工具观测带回，用于收集召回 pk
     )
@@ -170,6 +200,8 @@ def _level1(req: TripRequest) -> tuple[TripPlan | None, list[str]]:
         f"2) 对计划中的主要景点调用 amap_poi_search 获取地址与经纬度；\n"
         f"3) 调用 amap_weather 查询行程日期的天气；\n"
         f"4) 如需要可调用 amap_route_plan 规划景点间交通（transit 需提供 city 参数）。\n\n"
+        f"调用纪律（为提速强制）：知识库检索 ≤2 次、amap_weather 恰 1 次、amap_poi_search ≤2 次；"
+        f"路线规划仅在确需给出交通换乘时才调用。description 每条 ≤80 字。\n\n"
         f"{SCHEMA_HINT}"
     )
     executor = _build_agent_executor()
@@ -183,7 +215,9 @@ def _level1(req: TripRequest) -> tuple[TripPlan | None, list[str]]:
     data = _extract_plan_json(result.get("output", ""))
     plan = _validate(data) if data else None
     if plan is None:
-        logger.warning("L1 输出无法解析为 TripPlan，降级 L2")
+        # 输出采样入日志：便于定位是"无 JSON"还是"JSON 校验失败"
+        snippet = str(result.get("output", ""))[:300]
+        logger.warning("L1 输出无法解析为 TripPlan，降级 L2 | 输出前300字: {}", snippet)
     return plan, observations
 
 
@@ -253,10 +287,87 @@ def _level3(req: TripRequest, docs: list[Document]) -> TripPlan:
     )
 
 
+# ---------- 快速管道（fast 模式，默认） ----------
+
+def _run_fast(req: TripRequest) -> TripPlan:
+    """确定性管道 + 单次 LLM 结构化生成（约 20-50s）。
+
+    提速原理：把 Agent 的 N 轮串行 LLM 往返压缩为 1 轮——
+    检索/天气用代码直调，坐标由 _fill_missing_coords 事后确定性补全，
+    LLM 只负责"读材料 → 一次性编排撰写"。
+    """
+    docs = _retrieve(req)
+    allowed = {str(d.metadata.get("pk", "")) for d in docs if d.metadata.get("pk")}
+
+    weather_text = ""
+    if settings.amap_api_key:
+        try:
+            from datetime import timedelta
+
+            from app.services.amap_service import weather_casts
+
+            start = datetime.strptime(req.start_date, "%Y-%m-%d")
+            trip_dates = {
+                (start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(req.travel_days)
+            }
+            matched = [c for c in weather_casts(req.city) if c["date"] in trip_dates]
+            if matched:
+                rows = [
+                    "{date}: 白天{day_weather} {temperature}".format(
+                        date=c["date"], day_weather=c["day_weather"], temperature=c["temperature"]
+                    )
+                    for c in matched
+                ]
+                weather_text = "[行程日期天气预报（高德，仅含与行程重叠的日期）]\n" + "\n".join(rows)
+            # 无匹配 = 行程日期超出高德约 4 天可预报窗口 → weather_text 留空，诚实不编造
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("天气获取失败（忽略）: {}", exc)
+
+    facts = [_build_context(docs)]
+    if weather_text:
+        facts.append(weather_text)
+
+    system = (
+        PLANNER_AGENT_PROMPT
+        + "\n\n下方是唯一事实来源（知识库片段 + 实时天气），引用其 [编号] 并保留 pk；"
+        "天气仅供行程参考，不得作为知识库 citation 的来源。"
+    )
+    human = (
+        f"需求：{req.model_dump_json()}\n\n事实材料：\n"
+        + "\n\n".join(facts)
+        + "\n\n"
+        + SCHEMA_HINT
+        + "\n\n生成要求：description/overall_suggestions 简洁（每条≤80字）且必须标注 [编号]；"
+        "坐标未知就写 0（后端会自动补全为真实 POI 坐标），严禁编造经纬度；"
+        "citations.chunk_id 只能使用材料中的 pk。"
+        "weather_info 只允许填材料「天气预报」中真实出现的日期；"
+        "若没有天气材料（行程超出高德约 4 天可预报窗口），weather_info 必须为 []，严禁编造天气。"
+    )
+    try:
+        text = get_llm().invoke([("system", system), ("human", human)]).content
+        data = _extract_plan_json(str(text))
+        plan = _validate(data) if data else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fast 模式生成失败，降级模板: {}", exc)
+        plan = None
+
+    if plan is None:
+        logger.warning("进入模板兜底（fast 解析失败, city={}）", req.city)
+        plan = _level3(req, docs)
+    return _filter_citations(_fill_missing_coords(plan, req), allowed)
+
+
 # ---------- 对外入口 ----------
 
 def run_planner(req: TripRequest) -> TripPlan:
-    """执行规划（三级降级，保证任何情况下都返回合法 TripPlan）。"""
+    """规划入口：按 PLANNER_MODE 分发 fast（默认，快）或 agent（完整编排）。"""
+    if settings.planner_mode == "agent":
+        return _run_agent_mode(req)
+    return _run_fast(req)
+
+
+def _run_agent_mode(req: TripRequest) -> TripPlan:
+    """Agent 完整模式：L1 完整 Agent → L2 RAG 直出 → L3 模板兜底。"""
     docs = _retrieve(req)
     allowed = {str(d.metadata.get("pk", "")) for d in docs if d.metadata.get("pk")}
 
@@ -265,11 +376,11 @@ def run_planner(req: TripRequest) -> TripPlan:
         plan, observations = _level1(req)
         if plan is not None:
             allowed |= _collect_pks(docs, observations)
-            return _filter_citations(plan, allowed)
+            return _filter_citations(_fill_missing_coords(plan, req), allowed)
         # L2 RAG 直出
         plan = _level2(req, docs)
         if plan is not None:
-            return _filter_citations(plan, allowed)
+            return _filter_citations(_fill_missing_coords(plan, req), allowed)
 
     logger.warning("进入 L3 模板兜底（city={}）", req.city)
     return _filter_citations(_level3(req, docs), allowed)
