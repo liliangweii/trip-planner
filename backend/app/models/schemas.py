@@ -1,0 +1,113 @@
+"""Pydantic 数据模型（核心 Schemas）。
+
+对应设计文档 §4。
+"""
+from pydantic import BaseModel, Field
+
+
+class Location(BaseModel):
+    """经纬度。"""
+
+    longitude: float
+    latitude: float
+
+
+class Citation(BaseModel):
+    """RAG 溯源引用（设计文档 §4 ★ 新增）。"""
+
+    chunk_id: str = Field(..., description="Milvus 主键")
+    source: str = Field(..., description="语料标题/出处")
+    url: str = ""
+    snippet: str = Field(..., description="命中原文片段（截断展示）")
+
+
+class Attraction(BaseModel):
+    """景点。"""
+
+    name: str
+    address: str
+    location: Location
+    visit_duration: int = Field(..., description="分钟", ge=0)
+    description: str
+    category: str
+    ticket_price: float = 0
+    citations: list[Citation] = Field(default_factory=list, description="该景点信息来源")
+
+
+class Meal(BaseModel):
+    """餐食。"""
+
+    type: str = Field(..., description="breakfast/lunch/dinner")
+    name: str = ""
+    description: str = ""
+    location: Location | None = None
+
+
+class Hotel(BaseModel):
+    """住宿。"""
+
+    name: str
+    address: str
+    location: Location
+    price_per_night: float = 0
+    description: str = ""
+
+
+class WeatherInfo(BaseModel):
+    """天气信息。"""
+
+    date: str
+    day_weather: str = ""
+    night_weather: str = ""
+    temperature: str = ""
+
+
+class Budget(BaseModel):
+    """预算。"""
+
+    currency: str = "CNY"
+    total: float = 0
+    breakdown: dict[str, float] = Field(
+        default_factory=dict, description="transport/accommodation/food/tickets/other"
+    )
+
+
+class DayPlan(BaseModel):
+    """单日行程。"""
+
+    date: str
+    day_index: int
+    description: str
+    transportation: str
+    accommodation: str
+    hotel: Hotel | None = None
+    attractions: list[Attraction] = Field(default_factory=list)
+    meals: list[Meal] = Field(default_factory=list, description="breakfast/lunch/dinner")
+
+
+class TripRequest(BaseModel):
+    """行程规划请求体（设计文档 §4）。"""
+
+    city: str = Field(..., description="目的地城市")
+    start_date: str = Field(..., description="YYYY-MM-DD")
+    end_date: str = Field(..., description="YYYY-MM-DD")
+    travel_days: int = Field(default=1, ge=1, le=15)
+    transportation: str = Field(default="公共交通", description="公共交通/自驾/步行偏好")
+    accommodation: str = Field(default="经济型", description="住宿偏好")
+    preferences: list[str] = Field(default_factory=list, description="旅行风格标签")
+    free_text_input: str = Field(default="", description="自由补充需求")
+
+
+class TripPlan(BaseModel):
+    """行程规划结果（设计文档 §4 ★ references 全局引用列表）。"""
+
+    city: str
+    start_date: str
+    end_date: str
+    days: list[DayPlan] = Field(default_factory=list)
+    weather_info: list[WeatherInfo] = Field(default_factory=list)
+    overall_suggestions: str = ""
+    budget: Budget = Field(default_factory=Budget)
+    references: list[Citation] = Field(
+        default_factory=list, description="全局引用列表，前端展示'参考攻略'"
+    )

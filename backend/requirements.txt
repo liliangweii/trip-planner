@@ -1,0 +1,33 @@
+# ===== LangChain 生态 =====
+# 注意：LangChain 1.x 已是当前主版本（pip 解析 langchain>=0.3 会得到 1.x）
+# P4 使用的 AgentExecutor / create_tool_calling_agent 已迁移至向后兼容包 langchain-classic
+langchain-core>=0.3
+langchain>=0.3
+langchain-classic>=1.0        # LangChain 1.x 向后兼容包（P4 Agent 所需）
+langchain-community>=0.3
+langchain-openai>=0.2
+langchain-milvus>=0.1
+langchain-text-splitters>=0.3
+
+# ===== 向量库与模型 =====
+pymilvus>=2.4
+
+# —— 以下为方案 A（本地 BGE-M3 / 本地重排序）专用，Python 3.14 上 torch 系 wheel 可能缺失 ——
+# 走方案 B（API Embedding）时无需安装；切方案 A 时取消注释（建议 Python 3.12 环境）
+# sentence-transformers>=3.0
+# FlagEmbedding>=1.3
+
+# ===== Web 与工程 =====
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.7
+pydantic-settings>=2.3
+httpx>=0.27
+python-dotenv>=1.0
+loguru>=0.7
+SQLAlchemy>=2.0               # 会话记忆存储
+python-multipart>=0.0.9       # FastAPI 文件上传（/api/kb/ingest）
+
+# ===== 评测（P6 阶段再装，避免影响 P1 环境搭建）=====
+# ragas>=0.2
+# datasets>=2.0
