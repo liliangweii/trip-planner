@@ -36,7 +36,7 @@ SCHEMA_HINT = """最终只输出一个 TripPlan JSON 对象（不要 markdown �
  "days": [{"date": "YYYY-MM-DD", "day_index": int 从1递增, "description": str,
    "transportation": str, "accommodation": str,
    "hotel": {"name": str, "address": str, "location": {"longitude": float, "latitude": float},
-             "price_per_night": float, "description": str} 或 null,
+             "price_per_night": float, "description": str}（须为行程推荐 1 家，多日可重复同一家；仅在完全无住宿材料时才为 null）,
    "attractions": [{"name": str, "address": str,
      "location": {"longitude": float, "latitude": float},
      "visit_duration": int 分钟, "description": str 须在句末标注[n],
@@ -61,11 +61,13 @@ _CTX_MAX = 280  # 每条上下文截断长度（控制 token）
 # ---------- 检索 ----------
 
 def _retrieve(req: TripRequest) -> list[Document]:
-    """为规划检索知识库：主攻略 + （偏好含美食时）追加 food 专项。"""
+    """为规划检索知识库：主攻略 + （偏好含美食时）追加 food 专项 + 始终追加 hotel 专项。"""
     retriever = get_retriever()
     queries = [f"{req.city} 旅行玩法攻略 {''.join(req.preferences)}"]
     if "美食" in req.preferences:
         queries.append(f"{req.city} 美食推荐")
+    # 始终检索住宿/酒店，保证规划有可引用的酒店素材（否则 hard 约束下 hotel 只能为 null）
+    queries.append(f"{req.city} 酒店住宿推荐 {req.accommodation}")
     docs: list[Document] = []
     seen: set[str] = set()
     for q in queries:
@@ -74,7 +76,7 @@ def _retrieve(req: TripRequest) -> list[Document]:
             if pk and pk not in seen:
                 seen.add(pk)
                 docs.append(d)
-    return docs[:10]
+    return docs[:12] # 截取前 12 条文档
 
 
 def _build_context(docs: list[Document]) -> str:
@@ -104,7 +106,31 @@ def _filter_citations(plan: TripPlan, allowed: set[str]) -> TripPlan:
     for day in plan.days:
         for attr in day.attractions:
             attr.citations = [c for c in attr.citations if c.chunk_id in allowed]
+        if day.hotel and day.hotel.citations:
+            day.hotel.citations = [c for c in day.hotel.citations if c.chunk_id in allowed]
     return plan
+
+
+def _gen_rules(req: TripRequest) -> str:
+    """生成期硬性要求：必须推荐酒店 + 必须按预算约束分配。"""
+    if req.budget_total:
+        budget_clause = (
+            f"预算约束：本次总预算为 {req.budget_total} 元（人民币）。"
+            "budget.total 与 breakdown（transport/accommodation/food/tickets）各项之和"
+            f"不得超过 {req.budget_total} 元；据此反推住宿档次、餐饮与门票取舍，"
+            "优先保证核心景点，超预算时削减非必要消费，不得出现总额超预算的规划。"
+        )
+    else:
+        budget_clause = (
+            "预算约束：用户未提供预算，请给出合理的总预估与 breakdown"
+            "（transport/accommodation/food/tickets）。"
+        )
+    return (
+        "住宿要求：必须依据知识库中的住宿/酒店信息，为本次行程推荐 1 家酒店，"
+        "将其填入每一天的 hotel 字段（多日行程推荐同一家即可），并为其标注 citations；"
+        "只有在完全没有任何住宿材料时才可将 hotel 设为 null。\n"
+        + budget_clause
+    )
 
 
 # ---------- JSON 提取 / 校验 ----------
@@ -202,7 +228,7 @@ def _level1(req: TripRequest) -> tuple[TripPlan | None, list[str]]:
         f"4) 如需要可调用 amap_route_plan 规划景点间交通（transit 需提供 city 参数）。\n\n"
         f"调用纪律（为提速强制）：知识库检索 ≤2 次、amap_weather 恰 1 次、amap_poi_search ≤2 次；"
         f"路线规划仅在确需给出交通换乘时才调用。description 每条 ≤80 字。\n\n"
-        f"{SCHEMA_HINT}"
+        f"{SCHEMA_HINT}\n\n{_gen_rules(req)}"
     )
     executor = _build_agent_executor()
     try:
@@ -234,7 +260,8 @@ def _level2(req: TripRequest, docs: list[Document]) -> TripPlan | None:
         (
             "human",
             f"需求：{req.model_dump_json()}\n\n{SCHEMA_HINT}"
-            + "\n（降级模式：无实时 POI/天气，location 一律 0.0，weather_info 可为空数组）",
+            + "\n（降级模式：无实时 POI/天气，location 一律 0.0，weather_info 可为空数组）"
+            + f"\n\n{_gen_rules(req)}",
         ),
     ]
     try:
@@ -296,7 +323,7 @@ def _run_fast(req: TripRequest) -> TripPlan:
     检索/天气用代码直调，坐标由 _fill_missing_coords 事后确定性补全，
     LLM 只负责"读材料 → 一次性编排撰写"。
     """
-    docs = _retrieve(req)
+    docs = _retrieve(req) # 检索
     allowed = {str(d.metadata.get("pk", "")) for d in docs if d.metadata.get("pk")}
 
     weather_text = ""
@@ -342,6 +369,7 @@ def _run_fast(req: TripRequest) -> TripPlan:
         "citations.chunk_id 只能使用材料中的 pk。"
         "weather_info 只允许填材料「天气预报」中真实出现的日期；"
         "若没有天气材料（行程超出高德约 4 天可预报窗口），weather_info 必须为 []，严禁编造天气。"
+        f"\n\n{_gen_rules(req)}"
     )
     try:
         text = get_llm().invoke([("system", system), ("human", human)]).content

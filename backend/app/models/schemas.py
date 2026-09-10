@@ -51,6 +51,7 @@ class Hotel(BaseModel):
     location: Location
     price_per_night: float = 0
     description: str = ""
+    citations: list[Citation] = Field(default_factory=list, description="该酒店信息来源")
 
 
 class WeatherInfo(BaseModel):
@@ -96,6 +97,9 @@ class TripRequest(BaseModel):
     accommodation: str = Field(default="经济型", description="住宿偏好")
     preferences: list[str] = Field(default_factory=list, description="旅行风格标签")
     free_text_input: str = Field(default="", description="自由补充需求")
+    budget_total: float | None = Field(
+        default=None, description="总预算（人民币元），可选；提供后规划须在该范围内分配"
+    )
 
 
 class TripPlan(BaseModel):

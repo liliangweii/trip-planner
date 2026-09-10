@@ -34,6 +34,7 @@ export interface TripRequest {
   accommodation?: string
   preferences?: string[]
   free_text_input?: string
+  budget_total?: number
 }
 
 export interface Citation {
@@ -72,6 +73,7 @@ export interface Hotel {
   location: Location
   price_per_night: number
   description?: string
+  citations?: Citation[]
 }
 
 export interface WeatherInfo {
