@@ -27,6 +27,7 @@ python-dotenv>=1.0
 loguru>=0.7
 SQLAlchemy>=2.0               # 会话记忆存储
 python-multipart>=0.0.9       # FastAPI 文件上传（/api/kb/ingest）
+redis>=5.0                    # 行程结果缓存（可选依赖；未安装/连不上自动降级禁用）
 
 # ===== 评测（P6）=====
 # 注意：ragas 0.4.x 的 collections 指标与 evaluate() 基类体系错位（实测报

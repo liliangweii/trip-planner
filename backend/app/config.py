@@ -77,6 +77,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- Redis 缓存（可选，fail-open：不可用时自动禁用，不影响主流程）----
+    redis_enabled: bool = Field(
+        default=True, description="是否启用 Redis 缓存（关闭则全部走原逻辑）"
+    )
+    redis_url: str = Field(default="redis://localhost:6379/0", description="Redis 连接地址")
+    plan_cache_ttl: int = Field(
+        default=43200, description="行程规划结果缓存 TTL（秒），默认 12 小时"
+    )
+
     # ---- 服务运行 ----
     app_host: str = Field(default="0.0.0.0")
     app_port: int = Field(default=8000)

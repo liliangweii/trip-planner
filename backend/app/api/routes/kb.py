@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Query, UploadFile
 from pydantic import BaseModel
 
 from app.rag.ingest import delete_by_source, ingest_directory, ingest_file, list_documents
+from app.services.cache import clear_plan_cache
 
 router = APIRouter()
 
@@ -43,7 +44,10 @@ def ingest(
             tmp.unlink(missing_ok=True)
         else:
             n = ingest_directory(city=city, category=category)
-        return IngestResponse(success=True, inserted_chunks=n, message="入库完成")
+        # 语料变了 → 旧行程缓存立即失效，否则新内容要等 TTL 才生效
+        cleared = clear_plan_cache()
+        msg = "入库完成" if not cleared else f"入库完成，已清理 {cleared} 条行程缓存"
+        return IngestResponse(success=True, inserted_chunks=n, message=msg)
     except Exception as exc:  # noqa: BLE001
         return IngestResponse(success=False, inserted_chunks=0, message=str(exc))
 
@@ -64,4 +68,6 @@ def delete_document(doc_id: str) -> dict:
 
     source = unquote(doc_id)
     delete_by_source(source)
-    return {"success": True, "deleted_source": source}
+    # 语料变更 → 行程缓存失效
+    cleared = clear_plan_cache()
+    return {"success": True, "deleted_source": source, "cleared_plan_cache": cleared}

@@ -75,7 +75,24 @@ services:
     depends_on:
       - "milvus"
 
+  # Redis：行程规划结果缓存（可选依赖）
+  # 未启动时后端自动降级为"不缓存"，规划功能不受影响
+  redis:
+    image: redis:7-alpine
+    container_name: triprag-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 volumes:
   etcd_data:
   minio_data:
   milvus_data:
+  redis_data:
