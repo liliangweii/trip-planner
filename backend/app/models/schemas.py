@@ -115,3 +115,13 @@ class TripPlan(BaseModel):
     references: list[Citation] = Field(
         default_factory=list, description="全局引用列表，前端展示'参考攻略'"
     )
+    # 降级标记：True 表示这是 L3 模板兜底产物（大模型未成功生成），并非真实规划。
+    # 由 planner_agent 在 LLM 调用失败/未配置时置位，便于前端/调用方区分"空计划"与真实计划。
+    degraded: bool = Field(
+        default=False,
+        description="是否降级产物（大模型未成功参与生成）。True 时整体_suggestions 含降级原因。",
+    )
+    degraded_reason: str = Field(
+        default="",
+        description="降级原因（如大模型 402 余额不足/未配置/输出无法解析）。空=正常生成。",
+    )

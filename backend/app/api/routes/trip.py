@@ -28,10 +28,20 @@ def plan_trip(req: TripRequest) -> TripPlan:
         logger.info("行程规划缓存命中: city={} days={}", req.city, req.travel_days)
         return cached
 
+    # 缓存未命中 → 必然调用大模型（run_planner 内部：fast=L3 确定性管道+单次LLM；
+    # agent=L1 Agent→L2 RAG直出→L3 兜底）。下面这条日志用于确认"cache miss 已触发 LLM 规划"。
+    logger.info("缓存未命中，调用大模型生成行程: city={} days={}", req.city, req.travel_days)
     try:
         plan = run_planner(req)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"规划失败：{exc}") from exc
+
+    # 降级产物（大模型未成功参与）明确告警，避免被误认为"正常空计划"
+    if getattr(plan, "degraded", False):
+        logger.warning(
+            "行程规划为降级产物（未走大模型真实生成）: city={} reason={}",
+            req.city, plan.degraded_reason,
+        )
 
     # 2) 完整产物写缓存（降级模板在缓存层内部会跳过）
     set_cached_plan(req, plan)

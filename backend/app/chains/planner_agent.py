@@ -371,17 +371,28 @@ def _run_fast(req: TripRequest) -> TripPlan:
         "若没有天气材料（行程超出高德约 4 天可预报窗口），weather_info 必须为 []，严禁编造天气。"
         f"\n\n{_gen_rules(req)}"
     )
+    llm_error: str | None = None
     try:
         text = get_llm().invoke([("system", system), ("human", human)]).content
         data = _extract_plan_json(str(text))
         plan = _validate(data) if data else None
+        if plan is None:
+            llm_error = "大模型未返回可解析的 TripPlan JSON（可能为空内容）"
     except Exception as exc:  # noqa: BLE001
         logger.warning("fast 模式生成失败，降级模板: {}", exc)
+        llm_error = f"大模型调用失败：{exc}"
         plan = None
 
     if plan is None:
         logger.warning("进入模板兜底（fast 解析失败, city={}）", req.city)
         plan = _level3(req, docs)
+        # 回落到模板 = 大模型没有成功参与生成，明确标记为降级，附上失败原因，避免被误认为"真实空计划"
+        plan.degraded = True
+        plan.degraded_reason = llm_error or "大模型未成功生成"
+        plan.overall_suggestions = (
+            f"【降级模板·非真实规划】{plan.degraded_reason}。"
+            f"以下仅为知识库参考，请修复大模型配置后重试。\n" + plan.overall_suggestions
+        )
     return _filter_citations(_fill_missing_coords(plan, req), allowed)
 
 
@@ -409,6 +420,16 @@ def _run_agent_mode(req: TripRequest) -> TripPlan:
         plan = _level2(req, docs)
         if plan is not None:
             return _filter_citations(_fill_missing_coords(plan, req), allowed)
+        reason = "大模型（agent 模式）L1/L2 均未能生成合法 TripPlan"
+    else:
+        reason = "未配置 LLM_API_KEY，跳过大模型真实生成"
 
-    logger.warning("进入 L3 模板兜底（city={}）", req.city)
-    return _filter_citations(_level3(req, docs), allowed)
+    logger.warning("进入 L3 模板兜底（city={}）: {}", req.city, reason)
+    plan = _level3(req, docs)
+    plan.degraded = True
+    plan.degraded_reason = reason
+    plan.overall_suggestions = (
+        f"【降级模板·非真实规划】{reason}。以下仅为知识库参考，请配置/修复大模型后重试。\n"
+        + plan.overall_suggestions
+    )
+    return _filter_citations(plan, allowed)
