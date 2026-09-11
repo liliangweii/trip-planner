@@ -22,12 +22,14 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from loguru import logger
 
 from app.config import settings
-from app.models.schemas import DayPlan, TripPlan, TripRequest
+from app.models.schemas import DayPlan, Hotel, Location, TripPlan, TripRequest
 from app.rag.prompts import PLANNER_AGENT_PROMPT
 from app.rag.retriever import get_retriever
 from app.services.llm_service import get_llm
+from app.services.amap_service import poi_photos
 from app.tools.amap import amap_poi_search_tool, amap_route_plan_tool, amap_weather_tool
 from app.tools.knowledge_search import search_travel_knowledge_tool
+from app.utils.city_norm import normalize_city
 
 # ---------- Schema 提示（写进 LLM 指令，保证可被 json.loads + model_validate） ----------
 
@@ -60,23 +62,45 @@ _CTX_MAX = 280  # 每条上下文截断长度（控制 token）
 
 # ---------- 检索 ----------
 
-def _retrieve(req: TripRequest) -> list[Document]:
-    """为规划检索知识库：主攻略 + （偏好含美食时）追加 food 专项 + 始终追加 hotel 专项。"""
+def _retrieve(req: TripRequest) -> tuple[list[Document], bool]:
+    """为规划检索知识库：主攻略 + （偏好含美食时）追加 food 专项 + 始终追加 hotel 专项。
+
+    返回 (docs, city_specific)：
+    - city_specific=True：命中了「城市专属」分区数据（知识库覆盖该城市）。
+    - city_specific=False：知识库无该城市专属数据，已**回退全局检索**（仅作通用参考），
+      调用方应据此把计划标记为降级、并剥离异地引用，避免把其他城市素材错贴到本城市。
+
+    城市名先归一化（去「市/省/自治区」后缀、全角→半角、别称映射），保证与
+    Milvus 分区键（city 字段精确匹配）一致。
+    """
+    city = normalize_city(req.city)
     retriever = get_retriever()
-    queries = [f"{req.city} 旅行玩法攻略 {''.join(req.preferences)}"]
+    queries = [f"{city} 旅行玩法攻略 {''.join(req.preferences)}"]
     if "美食" in req.preferences:
-        queries.append(f"{req.city} 美食推荐")
+        queries.append(f"{city} 美食推荐")
     # 始终检索住宿/酒店，保证规划有可引用的酒店素材（否则 hard 约束下 hotel 只能为 null）
-    queries.append(f"{req.city} 酒店住宿推荐 {req.accommodation}")
+    queries.append(f"{city} 酒店住宿推荐 {req.accommodation}")
+
     docs: list[Document] = []
     seen: set[str] = set()
-    for q in queries:
-        for d in retriever.search(q, city=req.city, top_k=6):
-            pk = str(d.metadata.get("pk", ""))
-            if pk and pk not in seen:
-                seen.add(pk)
-                docs.append(d)
-    return docs[:12] # 截取前 12 条文档
+
+    def _collect(filter_city: str | None) -> None:
+        for q in queries:
+            for d in retriever.search(q, city=filter_city, top_k=6):
+                pk = str(d.metadata.get("pk", ""))
+                if pk and pk not in seen:
+                    seen.add(pk)
+                    docs.append(d)
+
+    _collect(city)  # 先按城市精确分区检索
+    city_specific = len(docs) > 0
+
+    # 回退：该城市在知识库无专属数据 → 退化为全局检索，保证仍有素材可用（而非空计划）
+    if not city_specific:
+        _collect(None)
+        logger.warning("知识库无「{}」专属数据，已回退全局检索（归一化后 city={}）", req.city, city)
+
+    return docs[:12], city_specific
 
 
 def _build_context(docs: list[Document]) -> str:
@@ -186,6 +210,37 @@ def _fill_missing_coords(plan: TripPlan, req: TripRequest) -> TripPlan:
     return plan
 
 
+def _fill_hotel_fallback(plan: TripPlan, req: TripRequest) -> TripPlan:
+    """确定性酒店兜底：知识库无住宿素材时，LLM 常把 hotel 置为 null。
+
+    这里用高德 POI 检索「{city} 酒店」首条结果，补一个真实酒店
+    （名称/地址/坐标），保证「推荐酒店」卡片在所有城市都能展示。
+    任何失败都静默跳过（保持主流程优先）。
+    """
+    if not settings.amap_api_key:
+        return plan
+    try:
+        from app.services.amap_service import poi_location
+
+        for day in plan.days:
+            if day.hotel and day.hotel.name:
+                continue  # 已有酒店不覆盖
+            hit = poi_location(f"{req.city} 酒店", req.city)
+            if not hit:
+                continue
+            day.hotel = Hotel(
+                name=hit["name"],
+                address=hit["address"],
+                location=Location(longitude=hit["lng"], latitude=hit["lat"]),
+                price_per_night=0.0,
+                description="（基于高德 POI 自动匹配，实际价格以预订为准）",
+                citations=[],
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("酒店兜底失败（忽略）: {}", exc)
+    return plan
+
+
 # ---------- 三级降级 ----------
 
 def _build_agent_executor():
@@ -265,7 +320,12 @@ def _level2(req: TripRequest, docs: list[Document]) -> TripPlan | None:
         ),
     ]
     try:
-        text = get_llm().invoke(messages).content
+        text = (
+            get_llm()
+            .bind(response_format={"type": "json_object"})
+            .invoke(messages)
+            .content
+        )
         data = _extract_plan_json(str(text))
         return _validate(data) if data else None
     except Exception as exc:  # noqa: BLE001
@@ -323,7 +383,7 @@ def _run_fast(req: TripRequest) -> TripPlan:
     检索/天气用代码直调，坐标由 _fill_missing_coords 事后确定性补全，
     LLM 只负责"读材料 → 一次性编排撰写"。
     """
-    docs = _retrieve(req) # 检索
+    docs, city_specific = _retrieve(req)  # 检索（无城市专属数据时内部回退全局）
     allowed = {str(d.metadata.get("pk", "")) for d in docs if d.metadata.get("pk")}
 
     weather_text = ""
@@ -372,16 +432,36 @@ def _run_fast(req: TripRequest) -> TripPlan:
         f"\n\n{_gen_rules(req)}"
     )
     llm_error: str | None = None
-    try:
-        text = get_llm().invoke([("system", system), ("human", human)]).content
-        data = _extract_plan_json(str(text))
-        plan = _validate(data) if data else None
-        if plan is None:
-            llm_error = "大模型未返回可解析的 TripPlan JSON（可能为空内容）"
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("fast 模式生成失败，降级模板: {}", exc)
-        llm_error = f"大模型调用失败：{exc}"
-        plan = None
+    plan: TripPlan | None = None
+    # 单次失败时重试一次（json_object 模式下模型偶发返回空/非 JSON），提升稳定性
+    for _attempt in range(2):
+        try:
+            # 强制 JSON 输出：deepseek-v4-flash 等原生 agent 模型默认会走 DSML 工具调用
+            # 协议（而非纯文本 JSON），导致解析失败 → 静默降级空模板。json_object 模式
+            # 能稳定压制该行为，要求模型只输出一个 JSON 对象。
+            text = (
+                get_llm()
+                .bind(response_format={"type": "json_object"})
+                .invoke([("system", system), ("human", human)])
+                .content
+            )
+            data = _extract_plan_json(str(text))
+            plan = _validate(data) if data else None
+            if plan is not None:
+                break
+            # 区分"空内容"与"返回了 agent 工具调用协议"——后者是 deepseek-v4-flash 等
+            # 原生 agent 模型的典型失败形态，提示用户换普通 chat 模型或开启 JSON 模式
+            if "<｜DSML｜｜" in str(text):
+                llm_error = (
+                    "大模型返回了工具调用协议(DSML)而非 JSON：当前模型为 agent 型，"
+                    "请改用普通 chat 模型（如 deepseek-chat）或在配置中开启 JSON 模式"
+                )
+            else:
+                llm_error = "大模型未返回可解析的 TripPlan JSON（可能为空内容）"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fast 模式生成失败，降级模板: {}", exc)
+            llm_error = f"大模型调用失败：{exc}"
+            plan = None
 
     if plan is None:
         logger.warning("进入模板兜底（fast 解析失败, city={}）", req.city)
@@ -393,21 +473,88 @@ def _run_fast(req: TripRequest) -> TripPlan:
             f"【降级模板·非真实规划】{plan.degraded_reason}。"
             f"以下仅为知识库参考，请修复大模型配置后重试。\n" + plan.overall_suggestions
         )
-    return _filter_citations(_fill_missing_coords(plan, req), allowed)
+        # 城市有专属数据时保留知识库引用；无专属数据（已全局回退）则剥离异地引用
+        strip_allowed = set() if not city_specific else allowed
+        return _filter_citations(
+            _fill_missing_coords(_fill_hotel_fallback(plan, req), req), strip_allowed
+        )
+
+    # 计划生成成功，但若知识库无该城市专属数据（已全局回退），诚实标记为降级并剥离异地引用
+    if not city_specific:
+        plan.degraded = True
+        plan.degraded_reason = (
+            f"知识库暂无「{req.city}」专属攻略，已基于通用旅行知识生成，仅供参考；"
+            f"如需精准本地攻略请补充该城市数据。"
+        )
+        plan.overall_suggestions = (
+            f"【通用知识生成·非本地攻略】{plan.degraded_reason}\n" + plan.overall_suggestions
+        )
+        # 去掉异地素材引用，避免把其他城市来源错贴到本城市
+        plan.references = []
+        for day in plan.days:
+            for attr in day.attractions:
+                attr.citations = []
+            if day.hotel:
+                day.hotel.citations = []
+        allowed = set()
+
+    return _filter_citations(
+        _fill_missing_coords(_fill_hotel_fallback(plan, req), req), allowed
+    )
+
+
+# ---------- 图片补充（高德 POI 图片）----------
+
+_photo_cache: dict[tuple[str, str], str] = {}
+
+
+def _get_photo(name: str, city: str) -> str:
+    """取景点/酒店图片 URL，带进程内缓存避免重复调用高德。"""
+    if not name or not city:
+        return ""
+    key = (name, city)
+    if key in _photo_cache:
+        return _photo_cache[key]
+    try:
+        url = poi_photos(name, city)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("获取图片失败 {}/{}: {}", city, name, exc)
+        url = ""
+    _photo_cache[key] = url
+    return url
+
+
+def _fill_images(plan: TripPlan, city: str) -> TripPlan:
+    """为行程中的景点与酒店补充高德 POI 图片 URL（可选，失败留空）。"""
+    if not settings.amap_api_key:
+        return plan
+    for day in plan.days:
+        for attr in day.attractions:
+            if not attr.image_url:
+                attr.image_url = _get_photo(attr.name, city)
+        if day.hotel and not day.hotel.image_url:
+            day.hotel.image_url = _get_photo(day.hotel.name, city)
+    return plan
 
 
 # ---------- 对外入口 ----------
 
 def run_planner(req: TripRequest) -> TripPlan:
-    """规划入口：按 PLANNER_MODE 分发 fast（默认，快）或 agent（完整编排）。"""
-    if settings.planner_mode == "agent":
-        return _run_agent_mode(req)
-    return _run_fast(req)
+    """规划入口：按 PLANNER_MODE 分发 fast（默认，快）或 agent（完整编排）。
+
+    入口处先归一化城市名，保证检索分区路由、天气、POI 图片等各环节使用一致的城市标识。
+    """
+    if req.city:
+        req.city = normalize_city(req.city) or req.city
+    plan = _run_agent_mode(req) if settings.planner_mode == "agent" else _run_fast(req)
+    # 统一补充景区/酒店图片（高德 POI 图片；失败不影响主流程）
+    _fill_images(plan, req.city)
+    return plan
 
 
 def _run_agent_mode(req: TripRequest) -> TripPlan:
     """Agent 完整模式：L1 完整 Agent → L2 RAG 直出 → L3 模板兜底。"""
-    docs = _retrieve(req)
+    docs, city_specific = _retrieve(req)
     allowed = {str(d.metadata.get("pk", "")) for d in docs if d.metadata.get("pk")}
 
     # L1 完整 Agent
@@ -415,11 +562,11 @@ def _run_agent_mode(req: TripRequest) -> TripPlan:
         plan, observations = _level1(req)
         if plan is not None:
             allowed |= _collect_pks(docs, observations)
-            return _filter_citations(_fill_missing_coords(plan, req), allowed)
+            return _filter_citations(_fill_missing_coords(_fill_hotel_fallback(plan, req), req), allowed)
         # L2 RAG 直出
         plan = _level2(req, docs)
         if plan is not None:
-            return _filter_citations(_fill_missing_coords(plan, req), allowed)
+            return _filter_citations(_fill_missing_coords(_fill_hotel_fallback(plan, req), req), allowed)
         reason = "大模型（agent 模式）L1/L2 均未能生成合法 TripPlan"
     else:
         reason = "未配置 LLM_API_KEY，跳过大模型真实生成"
@@ -428,8 +575,20 @@ def _run_agent_mode(req: TripRequest) -> TripPlan:
     plan = _level3(req, docs)
     plan.degraded = True
     plan.degraded_reason = reason
+    # 知识库无该城市专属数据时，剥离异地引用并说明
+    if not city_specific:
+        plan.degraded_reason = (
+            f"知识库暂无「{req.city}」专属攻略（{reason}），已基于通用旅行知识生成，仅供参考"
+        )
+        plan.references = []
+        for day in plan.days:
+            for attr in day.attractions:
+                attr.citations = []
+            if day.hotel:
+                day.hotel.citations = []
+        allowed = set()
     plan.overall_suggestions = (
-        f"【降级模板·非真实规划】{reason}。以下仅为知识库参考，请配置/修复大模型后重试。\n"
+        f"【降级模板·非真实规划】{plan.degraded_reason}。以下仅为知识库参考，请配置/修复大模型后重试。\n"
         + plan.overall_suggestions
     )
-    return _filter_citations(plan, allowed)
+    return _filter_citations(_fill_missing_coords(_fill_hotel_fallback(plan, req), req), allowed)

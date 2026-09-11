@@ -32,6 +32,7 @@ class Attraction(BaseModel):
     category: str
     ticket_price: float = 0
     citations: list[Citation] = Field(default_factory=list, description="该景点信息来源")
+    image_url: str = Field(default="", description="景区图片 URL（由高德 POI 图片补充，可选）")
 
 
 class Meal(BaseModel):
@@ -52,6 +53,7 @@ class Hotel(BaseModel):
     price_per_night: float = 0
     description: str = ""
     citations: list[Citation] = Field(default_factory=list, description="该酒店信息来源")
+    image_url: str = Field(default="", description="酒店图片 URL（由高德 POI 图片补充，可选）")
 
 
 class WeatherInfo(BaseModel):

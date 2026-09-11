@@ -2,10 +2,14 @@
 
 对应设计文档 §6.3、§7。
 """
+from urllib.parse import quote
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from loguru import logger
 
 from app.models.schemas import TripPlan, TripRequest
+from app.services.pdf_export import trip_plan_to_pdf
 
 router = APIRouter()
 
@@ -46,3 +50,25 @@ def plan_trip(req: TripRequest) -> TripPlan:
     # 2) 完整产物写缓存（降级模板在缓存层内部会跳过）
     set_cached_plan(req, plan)
     return plan
+
+
+@router.post("/export/pdf")
+def export_plan_pdf(plan: TripPlan) -> Response:
+    """导出行程计划为 PDF（后端 reportlab 渲染，中文 CID 字体，无需字体文件）。
+
+    前端把已生成的 TripPlan 原样回传即可；返回 application/pdf 触发浏览器下载。
+    """
+    try:
+        pdf_bytes = trip_plan_to_pdf(plan)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("PDF 导出失败: {}", exc)
+        raise HTTPException(status_code=500, detail=f"PDF 导出失败：{exc}") from exc
+
+    # RFC 5987 / 2231 文件名编码：兼容中文文件名（多数浏览器取 filename*=）
+    safe_name = f"{plan.city or 'trip'}_行程计划.pdf"
+    disposition = f"attachment; filename={quote(safe_name)}; filename*=UTF-8''{quote(safe_name)}"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": disposition},
+    )

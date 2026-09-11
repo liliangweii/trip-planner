@@ -105,6 +105,40 @@ def poi_location(query: str, city: str) -> dict | None:
     return {"name": p.get("name", ""), "address": p.get("address", ""), "lng": lng, "lat": lat}
 
 
+def poi_photos(query: str, city: str) -> str:
+    """返回 POI 第一张图片 URL（高德 photos），无图或异常时返回空串。
+
+    用于给行程中的景点/酒店补充图片。统一转 https 以避免 http 页面 mixed-content 拦截。
+    """
+    try:
+        data = _get(
+            "/v3/place/text",
+            {
+                "keywords": query,
+                "city": city,
+                "citylimit": "true",
+                "offset": 1,
+                "page": 1,
+                "extensions": "all",
+            },
+        )
+    except RuntimeError:
+        return ""
+    pois = data.get("pois") or []
+    if not pois:
+        return ""
+    photos = pois[0].get("photos") or []
+    if not photos:
+        return ""
+    url = (photos[0].get("url") or "").strip()
+    if not url:
+        return ""
+    # 统一 https，避免 http 页面 mixed-content 拦截
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url
+
+
 # ---------- 天气 ----------
 
 def weather(city: str) -> str:

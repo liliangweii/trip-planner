@@ -10,6 +10,26 @@ export function planTrip(req: TripRequest) {
   return api.post<TripPlan>('/trip/plan', req, { timeout: 300000 })
 }
 
+/** POST /api/trip/export/pdf —— 导出行程计划为 PDF（回传 TripPlan，返回 PDF 二进制流） */
+export function exportPlanPdf(plan: TripPlan) {
+  return api.post('/trip/export/pdf', plan, {
+    responseType: 'blob',
+    timeout: 60000,
+  })
+}
+
+/** 触发浏览器下载一段二进制（PDF 等） */
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
 /** POST /api/chat —— RAG 问答（SSE 流式），返回 fetch Response */
 export async function chatStream(sessionId: string, question: string) {
   return fetch(`${import.meta.env.VITE_API_BASE || '/api'}/chat`, {
@@ -58,6 +78,7 @@ export interface Attraction {
   category: string
   ticket_price: number
   citations: Citation[]
+  image_url: string
 }
 
 export interface Meal {
@@ -74,6 +95,7 @@ export interface Hotel {
   price_per_night: number
   description?: string
   citations?: Citation[]
+  image_url?: string
 }
 
 export interface WeatherInfo {
@@ -109,6 +131,8 @@ export interface TripPlan {
   overall_suggestions: string
   budget: Budget
   references: Citation[]
+  degraded?: boolean
+  degraded_reason?: string
 }
 
 export default api
